@@ -1,0 +1,44 @@
+# WordPress + MySQL lab for CVE-2026-109618 / CVE-2026-109619.
+#
+# This is a research surface: the chain targets Apache's mod_php worker, not
+# WordPress's application code. We layer our prefork + display_errors + 8M
+# memory_limit knobs onto the stock wordpress:*-apache image so the vuln
+# conditions match the other labs. The DB only exists so WordPress's /index.php
+# serves a real PHP response (and doesn't hang on a missing DB connection).
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: p2s-lab-wp-db
+    environment:
+      MYSQL_DATABASE: wp
+      MYSQL_USER: wp
+      MYSQL_PASSWORD: wp
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - wp-db:/var/lib/mysql
+    restart: unless-stopped
+
+  wp:
+    # Pinned: 6.6.2-php8.3-apache ships PHP 8.3.13 (vulnerable).
+    # The current wordpress:php8.3-apache ships 8.3.36 (patched) so it won't
+    # exploit, by design. Bump this tag when a newer vulnerable PHP ships.
+    image: wordpress:6.6.2-php8.3-apache
+    container_name: p2s-lab-wp
+    depends_on:
+      - db
+    ports:
+      - "127.0.0.1:8108:80"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wp
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+    volumes:
+      - ../../php.ini:/usr/local/etc/php/conf.d/zz-php2shell.ini:ro
+      - ../../apache.conf:/etc/apache2/conf-enabled/zz-php2shell.conf:ro
+      - ../../../out:/out:rw
+    restart: unless-stopped
+
+volumes:
+  wp-db:

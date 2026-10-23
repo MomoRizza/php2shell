@@ -1,0 +1,23 @@
+{
+  "name": "php-lab",
+  "php_version": null,
+  "distro": "lab",
+  "arch": "amd64",
+  "image": "custom",
+  "apache_version": "2.4.68",
+  "stages": {
+    "stage1_n": 892,
+    "stage2_t": 443,
+    "stage2_v": 1,
+    "stage3_pads": [[8, 7], [7, 7], [7, 7], [7, 7], [7, 7], [7, 7]],
+    "stage3_carrier": false
+  },
+  "offsets": {
+    "htdata_offset": "0x6E0D8",
+    "zif_offset": "0x43A870",
+    "dtor_offset": "0x613C50"
+  },
+  "oom_mb": 12,
+  "rce_verified": true,
+  "notes": "Original lab build: Apache 2.4.68 with a minimal PHP."
+}
