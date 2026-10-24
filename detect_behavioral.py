@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-php2shell behavioral detector — finds vulnerable PHP WITHOUT version headers.
+php2shell behavioral assessment — collects signals, not proof of vulnerability.
 
-Works when expose_php=Off, display_errors=Off, no X-Powered-By, no error pages.
+Can collect heuristic signals when version banners and errors are hidden.
 Uses 4-layer behavioral probing:
   1. PHP presence (heuristics)
   2. session.upload_progress feature detection
-  3. OOM worker-crash differential (the vulnerability fingerprint)
+  3. Optional resource-stress response observations (not CVE-specific)
   4. Worker stability confirmation
 
-NON-DESTRUCTIVE: this causes at most a worker restart (same as any large POST
-that hits memory_limit on unpatched PHP). No shellcode, no exploitation, no
-data corruption. The target serves normal traffic throughout.
+The default runs layers 1-2, including small multipart POSTs. --deep explicitly
+opts into oversized POSTs that can disrupt service. Network errors, 502 responses,
+and recovery do not establish memory corruption, patch status, or either CVE.
 
 Usage:
   python3 detect_behavioral.py https://target.example/
@@ -32,6 +32,13 @@ import time
 import urllib.error
 import urllib.request
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ── version classification (same as detect_php2shell.py) ──────────────
 
 FIXED = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
@@ -48,7 +55,7 @@ def classify_version(ver_str):
     if key in FIXED:
         return (maj, mino, pat), "vulnerable" if pat < FIXED[key] else "patched"
     if key < (8, 2):
-        return (maj, mino, pat), "eol_vulnerable"  # no patch exists
+        return (maj, mino, pat), "eol_vulnerable"  # verify vendor backports separately
     return (maj, mino, pat), "unknown_branch"
 
 
@@ -217,13 +224,12 @@ def probe_oom_behavior(base_url, timeout=20, proxy=None):
     """
     Send a multipart POST with a body near memory_limit to observe the
     failure mode:
-      - 502 / connection reset = worker crashed (VULNERABLE: unpatched OOM -> longjmp)
-      - 500 = graceful error (PATCHED: soft OOM at VM safe point)
-      - 200/other = memory_limit not hit or not PHP
+      - 502 / connection reset = nonspecific transport or upstream failure
+      - 500 = nonspecific server error
+      - 200/other = no diagnostic conclusion
 
     Tests at 8M, 16M, 32M (common memory_limit values).
-    Each probe kills at most one FPM/mod_php worker — same as any large
-    POST in production. Non-destructive.
+    These probes may disrupt service; none of these observations proves a CVE.
     """
     results = {"oom_crash_detected": False, "probes": [], "verdict": "unknown"}
 
@@ -235,7 +241,7 @@ def probe_oom_behavior(base_url, timeout=20, proxy=None):
 
         if probe["crash_signal"]:
             results["oom_crash_detected"] = True
-            results["verdict"] = "likely_vulnerable"
+            results["verdict"] = "inconclusive_failure_signal"
             results["crash_at"] = limit_label
             break  # one crash is enough signal
 
@@ -334,7 +340,7 @@ def _send_oom_probe(base_url, body_size, label, timeout, proxy):
 
             if result["status_code"] == 502:
                 result["crash_signal"] = True
-                result["detail"] = "502 Bad Gateway — FPM/mod_php worker likely crashed"
+                result["detail"] = "502 Bad Gateway — nonspecific upstream failure"
             elif result["status_code"] == 500:
                 result["detail"] = "500 — graceful error (may be patched OOM or app error)"
             elif result["status_code"] in (200, 301, 302):
@@ -343,18 +349,18 @@ def _send_oom_probe(base_url, body_size, label, timeout, proxy):
                 result["detail"] = f"{result['status_code']}"
         else:
             result["crash_signal"] = True
-            result["detail"] = "empty response — connection reset (worker crash)"
+            result["detail"] = "empty response — cause unknown"
 
     except ConnectionResetError:
         elapsed = int((time.monotonic() - t0) * 1000)
         result["response_time_ms"] = elapsed
         result["crash_signal"] = True
-        result["detail"] = "ConnectionReset — worker crashed during response"
+        result["detail"] = "ConnectionReset — cause unknown"
     except BrokenPipeError:
         elapsed = int((time.monotonic() - t0) * 1000)
         result["response_time_ms"] = elapsed
         result["crash_signal"] = True
-        result["detail"] = "BrokenPipe — worker crashed during send"
+        result["detail"] = "BrokenPipe — cause unknown"
     except socket.timeout:
         elapsed = int((time.monotonic() - t0) * 1000)
         result["response_time_ms"] = elapsed
@@ -370,7 +376,7 @@ def _send_oom_probe(base_url, body_size, label, timeout, proxy):
 def confirm_worker_stability(base_url, timeout=10, proxy=None):
     """
     After an OOM probe that caused a crash, send 3 normal GETs.
-    If all return 200, the worker respawned (confirms FPM/prefork behavior).
+    Successful requests show availability, not worker respawn or SAPI identity.
     If any return 502, the pool is under stress from our probes -> stop.
     """
     opener = _build_opener(proxy)
@@ -414,7 +420,7 @@ def _print_signals(signals):
 
 # ── Main ──────────────────────────────────────────────────────────────
 
-def scan_one(url, deep=True, proxy=None):
+def scan_one(url, deep=False, proxy=None):
     result = {
         "url": url,
         "php_detected": False,
@@ -422,6 +428,7 @@ def scan_one(url, deep=True, proxy=None):
         "version_status": None,
         "upload_progress": None,
         "oom_vulnerable": None,
+        "failure_signal_observed": None,
         "verdict": "unknown",
         "signals": [],
     }
@@ -442,17 +449,16 @@ def scan_one(url, deep=True, proxy=None):
         result["version_status"] = status
         print(f"\n    >>> PHP {version} — {status.upper()}")
         if status in ("vulnerable", "eol_vulnerable"):
-            result["verdict"] = "VULNERABLE"
-            result["oom_vulnerable"] = True
-            print(f"    >>> FINDING: version alone confirms vulnerability")
+            result["verdict"] = "AFFECTED_VERSION_REQUIRES_VERIFICATION"
+            print("    >>> Version is in the upstream affected range; verify vendor backports and runtime provenance")
             if status == "eol_vulnerable":
-                print(f"    >>> WARNING: EOL branch — NO PATCH AVAILABLE")
+                print("    >>> EOL branch: check vendor support and backports; upstream support has ended")
             if not deep:
                 return result
 
     if not is_php:
         print("\n    PHP not detected — skipping deeper probes")
-        result["verdict"] = "not_php"
+        result["verdict"] = "PHP_NOT_DETECTED_INCONCLUSIVE"
         return result
 
     # Layer 2
@@ -463,27 +469,27 @@ def scan_one(url, deep=True, proxy=None):
         icon = "●" if up_result["enabled"] else "○"
         print(f"    {icon} {ev}")
     if up_result["enabled"]:
-        print("    >>> upload_progress is ENABLED (attack surface exists)")
+        print("    >>> Session cookie observed; upload_progress configuration remains unverified")
     else:
         print("    >>> upload_progress not confirmed (may be disabled or detection blocked)")
 
     if not deep:
-        if result["verdict"] != "VULNERABLE":
-            result["verdict"] = "php_detected_needs_deep_scan"
+        result["verdict"] = ("UPSTREAM_FIXED_VERSION" if result["version_status"] == "patched"
+                             else "PHP_DETECTED_INCONCLUSIVE")
         return result
 
     # Layer 3
     print("\n[Layer 3] OOM worker-crash behavioral probe")
     print("    Sending oversized multipart POSTs to detect worker crash behavior...")
     oom_result = probe_oom_behavior(url, proxy=proxy)
-    result["oom_vulnerable"] = oom_result["oom_crash_detected"]
+    result["failure_signal_observed"] = oom_result["oom_crash_detected"]
     for probe in oom_result["probes"]:
         icon = "🔴" if probe["crash_signal"] else "⚪"
         t = f" ({probe['response_time_ms']}ms)" if probe["response_time_ms"] else ""
         print(f"    {icon} {probe['limit_target']}: {probe['detail']}{t}")
     if oom_result["oom_crash_detected"]:
-        print(f"    >>> CRASH at {oom_result.get('crash_at', '?')} — LIKELY VULNERABLE")
-        print(f"    >>> Worker died on OOM (unpatched longjmp behavior)")
+        print(f"    >>> Failure signal at {oom_result.get('crash_at', '?')} — INCONCLUSIVE")
+        print("    >>> Cannot distinguish worker failure from proxy, network, or application behavior")
     else:
         print(f"    >>> No crash observed")
         print(f"    >>> Could mean: patched, memory_limit=-1, body rejected by proxy/WAF, or not PHP")
@@ -494,28 +500,30 @@ def scan_one(url, deep=True, proxy=None):
         stability = confirm_worker_stability(url, proxy=proxy)
         print(f"    Follow-up GETs: {stability}")
         if all(s == 200 for s in stability):
-            print("    >>> Workers respawned normally — confirms crash-and-recover pattern")
+            print("    >>> Follow-up requests succeeded; worker identity and recovery cause are unknown")
         elif any(s == 502 for s in stability if isinstance(s, int)):
             print("    >>> Some 502s on follow-up — pool may be stressed, stopping")
 
     # Final verdict
-    if result["oom_vulnerable"]:
-        result["verdict"] = "LIKELY_VULNERABLE"
+    if result["failure_signal_observed"]:
+        result["verdict"] = "INCONCLUSIVE_FAILURE_SIGNAL"
     elif result.get("version_status") in ("vulnerable", "eol_vulnerable"):
-        result["verdict"] = "VULNERABLE"
+        result["verdict"] = "AFFECTED_VERSION_REQUIRES_VERIFICATION"
+    elif result.get("version_status") == "patched":
+        result["verdict"] = "UPSTREAM_FIXED_VERSION"
     elif result["upload_progress"]:
-        result["verdict"] = "INCONCLUSIVE_BUT_ATTACK_SURFACE_EXISTS"
+        result["verdict"] = "SESSION_COOKIE_OBSERVED_INCONCLUSIVE"
     elif is_php:
-        result["verdict"] = "PHP_DETECTED_NOT_CONFIRMED_VULNERABLE"
+        result["verdict"] = "PHP_DETECTED_INCONCLUSIVE"
     else:
-        result["verdict"] = "not_php"
+        result["verdict"] = "PHP_NOT_DETECTED_INCONCLUSIVE"
 
     print(f"\n{'='*60}")
     print(f"  VERDICT: {result['verdict']}")
     if result["version"]:
         print(f"  PHP Version: {result['version']} ({result['version_status']})")
-    print(f"  upload_progress: {'enabled' if result['upload_progress'] else 'unknown'}")
-    print(f"  OOM crash: {'YES' if result['oom_vulnerable'] else 'no'}")
+    print("  upload_progress: unverified (cookie heuristic only)")
+    print(f"  Failure signal observed: {result['failure_signal_observed']}")
     print(f"{'='*60}\n")
 
     return result
@@ -523,22 +531,23 @@ def scan_one(url, deep=True, proxy=None):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="php2shell behavioral detector — finds vulnerable PHP without version headers."
+        description="php2shell behavioral assessment (heuristics, not CVE confirmation)."
     )
     ap.add_argument("url", nargs="?", help="Target URL")
     ap.add_argument("-f", "--file", help="File with URLs (one per line)")
     ap.add_argument("-o", "--output", help="Write JSON results to file")
-    ap.add_argument("--deep", action="store_true", default=True,
-                    help="Full 4-layer detection (default)")
-    ap.add_argument("--quick", action="store_true",
-                    help="Layers 1-2 only (no OOM probe)")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--deep", action="store_true",
+                      help="Opt into disruptive oversized POST probes (not CVE confirmation)")
+    mode.add_argument("--quick", action="store_true",
+                      help="Layers 1-2 only (default; includes small multipart POSTs)")
     ap.add_argument("--proxy", help="HTTP proxy (e.g. http://127.0.0.1:8080)")
     args = ap.parse_args()
 
     if not args.url and not args.file:
         ap.error("provide a URL or -f file")
 
-    deep = not args.quick
+    deep = args.deep
     targets = []
     if args.url:
         targets.append(args.url)
@@ -554,7 +563,7 @@ def main():
     for url in targets:
         r = scan_one(url, deep=deep, proxy=args.proxy)
         results.append(r)
-        if "VULNERABLE" in r["verdict"].upper():
+        if r["verdict"] in {"AFFECTED_VERSION_REQUIRES_VERIFICATION"}:
             vulns += 1
 
     if args.output:
